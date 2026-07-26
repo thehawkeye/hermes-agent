@@ -160,7 +160,7 @@ def test_goal_judge_binding_reports_nonlocked_model(monkeypatch, caplog):
         "hermes_cli.config.load_config_readonly",
         lambda: {
             "auxiliary": {
-                "goal_judge": {"model": "google/gemini-3-flash-preview"}
+                "goal_judge": {"model": "untrusted/sentinel-model"}
             }
         },
     )
@@ -181,7 +181,7 @@ def test_spawn_blocks_goal_mode_when_binding_is_not_locked(
         "hermes_cli.config.load_config_readonly",
         lambda: {
             "auxiliary": {
-                "goal_judge": {"model": "google/gemini-3-flash-preview"}
+                "goal_judge": {"model": "untrusted/sentinel-model"}
             }
         },
     )
@@ -222,7 +222,7 @@ def test_spawn_checks_goal_judge_binding_in_assignee_profile(
         encoding="utf-8",
     )
     (worker_home / "config.yaml").write_text(
-        "auxiliary:\n  goal_judge:\n    model: google/gemini-3-flash-preview\n",
+        "auxiliary:\n  goal_judge:\n    model: untrusted/sentinel-model\n",
         encoding="utf-8",
     )
     popen_called = False
