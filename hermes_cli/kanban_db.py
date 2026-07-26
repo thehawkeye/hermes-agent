@@ -8755,9 +8755,34 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
     profile_arg = normalize_profile_name(task.assignee)
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile dir doesn't exist — defer resolution to the CLI's
+        # _apply_profile_override() via HERMES_PROFILE (set below).
+        # This only happens in test fixtures where the isolated
+        # HERMES_HOME never had profiles created.
+        profile_home = None
+
+    if task.goal_mode:
+        # Fail closed before Popen: decision 17 pins the auxiliary judge used
+        # by every goal-mode worker, so a drifted or missing binding must not
+        # launch a worker that the configured judge is unauthorized to grade.
+        from hermes_cli.goals import (
+            GOAL_JUDGE_BINDING_BLOCKED,
+            goal_judge_binding_block_reason,
+        )
+
+        binding_block = (
+            goal_judge_binding_block_reason(profile_home)
+            if profile_home is not None
+            else GOAL_JUDGE_BINDING_BLOCKED
+        )
+        if binding_block:
+            raise RuntimeError(binding_block)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -8771,15 +8796,8 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if profile_home is not None:
+        env["HERMES_HOME"] = profile_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

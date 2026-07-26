@@ -124,6 +124,11 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
 def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
     captured = {}
 
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"goal_judge": {"model": "MiniMax-M2.7"}}},
+    )
+
     class _FakeProc:
         pid = 4242
 
@@ -147,6 +152,104 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
     assert env.get("HERMES_KANBAN_GOAL_MAX_TURNS") == "5"
+
+
+def test_goal_judge_binding_reports_nonlocked_model(monkeypatch, caplog):
+    blocked = "BLOCKED: goal-judge model is not the locked decision 17 binding"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "goal_judge": {"model": "google/gemini-3-flash-preview"}
+            }
+        },
+    )
+
+    reason = goals.goal_judge_binding_block_reason()
+
+    assert reason == blocked
+    assert blocked in caplog.text
+
+
+def test_spawn_blocks_goal_mode_when_binding_is_not_locked(
+    kanban_home, monkeypatch
+):
+    blocked = "BLOCKED: goal-judge model is not the locked decision 17 binding"
+    popen_called = False
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "goal_judge": {"model": "google/gemini-3-flash-preview"}
+            }
+        },
+    )
+
+    def _unexpected_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        pytest.fail("goal-mode worker must not spawn with a non-locked judge")
+
+    monkeypatch.setattr("subprocess.Popen", _unexpected_popen)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal task",
+            assignee="default",
+            goal_mode=True,
+            goal_max_turns=5,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError) as exc_info:
+        kb._default_spawn(task, str(kanban_home))
+
+    assert str(exc_info.value) == blocked
+    assert popen_called is False
+
+
+def test_spawn_checks_goal_judge_binding_in_assignee_profile(
+    kanban_home, monkeypatch
+):
+    blocked = "BLOCKED: goal-judge model is not the locked decision 17 binding"
+    worker_home = kanban_home / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    (kanban_home / "config.yaml").write_text(
+        "auxiliary:\n  goal_judge:\n    model: MiniMax-M2.7\n",
+        encoding="utf-8",
+    )
+    (worker_home / "config.yaml").write_text(
+        "auxiliary:\n  goal_judge:\n    model: google/gemini-3-flash-preview\n",
+        encoding="utf-8",
+    )
+    popen_called = False
+
+    def _unexpected_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        pytest.fail("goal-mode worker must be checked against its own profile config")
+
+    monkeypatch.setattr("subprocess.Popen", _unexpected_popen)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal task",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=5,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError) as exc_info:
+        kb._default_spawn(task, str(kanban_home))
+
+    assert str(exc_info.value) == blocked
+    assert popen_called is False
 
 
 def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):

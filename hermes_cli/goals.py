@@ -37,6 +37,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +48,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
+LOCKED_GOAL_JUDGE_MODEL = "MiniMax-M2.7"
+GOAL_JUDGE_BINDING_BLOCKED = (
+    "BLOCKED: goal-judge model is not the locked decision 17 binding"
+)
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
 # before emitting the visible JSON — and the first /goal turn's prompt is
@@ -71,6 +77,40 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+
+
+def goal_judge_binding_block_reason(
+    hermes_home: Optional[str] = None,
+) -> Optional[str]:
+    """Return the decision-17 blocker when the configured judge drifts.
+
+    Goal-mode dispatch is fail-closed on this policy check. The model is read
+    from the same ``auxiliary.goal_judge.model`` config path that ``call_llm``
+    resolves; a missing value is therefore an observed empty binding and is a
+    mismatch, not permission to fall back silently.
+    """
+    home_token = None
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        if hermes_home is not None:
+            home_token = set_hermes_home_override(hermes_home)
+        cfg = load_config_readonly()
+    except Exception:
+        cfg = {}
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+    auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+    goal_judge = auxiliary.get("goal_judge", {}) if isinstance(auxiliary, dict) else {}
+    observed_model = (
+        goal_judge.get("model", "") if isinstance(goal_judge, dict) else ""
+    )
+    if observed_model != LOCKED_GOAL_JUDGE_MODEL:
+        logger.error(GOAL_JUDGE_BINDING_BLOCKED)
+        return GOAL_JUDGE_BINDING_BLOCKED
+    return None
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -1798,6 +1838,9 @@ __all__ = [
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS",
+    "LOCKED_GOAL_JUDGE_MODEL",
+    "GOAL_JUDGE_BINDING_BLOCKED",
+    "goal_judge_binding_block_reason",
     "load_goal",
     "save_goal",
     "clear_goal",
