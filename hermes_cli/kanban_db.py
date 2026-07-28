@@ -3062,121 +3062,393 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
-                else:
-                    task_status = "ready"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
-                    missing = _find_missing_parents(conn, parents)
-                    if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-
-                # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
-                # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
-                        )
-                    if not branch_name:
-                        # _pdb was imported above when project_obj was resolved.
-                        try:
-                            branch_name = _pdb.branch_name_for(
-                                project_obj, task_id, title=title or ""
-                            )
-                        except Exception:
-                            branch_name = None
-
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                    ),
-                )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
-                    )
-                _append_event(
+                _create_task_body(
                     conn,
-                    task_id,
-                    "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
+                    task_id=task_id,
+                    now=now,
+                    title=title,
+                    body=body,
+                    assignee=assignee,
+                    priority=priority,
+                    created_by=created_by,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                    branch_name=branch_name,
+                    project_id=project_id,
+                    project_obj=project_obj,
+                    project_repo=project_repo,
+                    tenant=tenant,
+                    idempotency_key=idempotency_key,
+                    max_runtime_seconds=max_runtime_seconds,
+                    skills_list=skills_list,
+                    max_retries=max_retries,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    goal_mode=goal_mode,
+                    goal_max_turns=goal_max_turns,
+                    session_id=session_id,
+                    parents=parents,
+                    initial_status=initial_status,
+                    triage=triage,
                 )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
                 raise
             # Retry with a fresh id.
+            continue
+    raise RuntimeError("unreachable")
+
+
+def _create_task_body(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    now: int,
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    priority: int,
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    project_id: Optional[str],
+    project_obj: Any,
+    project_repo: Optional[str],
+    tenant: Optional[str],
+    idempotency_key: Optional[str],
+    max_runtime_seconds: Optional[int],
+    skills_list: Optional[list],
+    max_retries: Optional[int],
+    model_override: Optional[str],
+    provider_override: Optional[str],
+    goal_mode: bool,
+    goal_max_turns: Optional[int],
+    session_id: Optional[str],
+    parents: Iterable[str],
+    initial_status: str,
+    triage: bool,
+) -> None:
+    """Insert a task row, its parent-link rows, and its ``created`` event.
+
+    This is the body of :func:`create_task` extracted into its own helper
+    so :func:`create_task_in_transaction` can reuse it inside a caller-
+    supplied transaction without opening a nested one.
+
+    Assumes ``conn`` already has an open write transaction — no
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` is issued here. The caller owns
+    the transaction envelope and the rollback-on-error semantics.
+    """
+    parents_list = list(parents)
+    # Determine task status from parent status, unless the caller
+    # parks it directly in blocked for human-ops review or in
+    # triage for a specifier.
+    if initial_status == "blocked":
+        task_status = "blocked"
+        if parents_list:
+            missing = _find_missing_parents(conn, parents_list)
+            if missing:
+                raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    elif triage:
+        task_status = "triage"
+    else:
+        task_status = "ready"
+        if parents_list:
+            missing = _find_missing_parents(conn, parents_list)
+            if missing:
+                raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+            # If any parent is not yet done, we're todo.
+            rows = conn.execute(
+                "SELECT status FROM tasks WHERE id IN "
+                "(" + ",".join("?" * len(parents_list)) + ")",
+                parents_list,
+            ).fetchall()
+            if any(r["status"] != "done" for r in rows):
+                task_status = "todo"
+    # Even in triage mode we still need to validate parent ids
+    # so the eventual link rows don't dangle.
+    if triage and parents_list:
+        missing = _find_missing_parents(conn, parents_list)
+        if missing:
+            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+
+    # Project-linked worktree: a fresh worktree dir under the repo
+    # plus a deterministic branch (project slug + task id). Together
+    # these kill the random ``wt/<task-id>`` worker fallback and the
+    # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
+    if project_obj is not None and workspace_kind == "worktree":
+        if project_repo and not workspace_path:
+            workspace_path = os.path.join(
+                project_repo, ".worktrees", task_id
+            )
+        if not branch_name:
+            # _pdb was imported in the create_task outer scope; we re-import
+            # here so this helper has no implicit dependency on the outer
+            # scope's locals.
+            try:
+                from hermes_cli import projects_db as _pdb
+                branch_name = _pdb.branch_name_for(
+                    project_obj, task_id, title=title or ""
+                )
+            except Exception:
+                branch_name = None
+
+    conn.execute(
+        """
+        INSERT INTO tasks (
+            id, title, body, assignee, status, priority,
+            created_by, created_at, workspace_kind, workspace_path,
+            branch_name, project_id, tenant, idempotency_key,
+            max_runtime_seconds,
+            skills, max_retries, model_override, provider_override,
+            goal_mode, goal_max_turns, session_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            title.strip(),
+            body,
+            assignee,
+            task_status,
+            priority,
+            created_by,
+            now,
+            workspace_kind,
+            workspace_path,
+            branch_name,
+            project_id,
+            tenant,
+            idempotency_key,
+            int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+            json.dumps(skills_list) if skills_list is not None else None,
+            int(max_retries) if max_retries is not None else None,
+            model_override,
+            provider_override,
+            1 if goal_mode else 0,
+            int(goal_max_turns) if goal_max_turns is not None else None,
+            session_id,
+        ),
+    )
+    for pid in parents_list:
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (pid, task_id),
+        )
+    _append_event(
+        conn,
+        task_id,
+        "created",
+        {
+            "assignee": assignee,
+            "status": task_status,
+            "parents": list(parents_list),
+            "tenant": tenant,
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+            "project_id": project_id,
+            "skills": list(skills_list) if skills_list else None,
+            "goal_mode": bool(goal_mode) or None,
+            "model_override": model_override,
+            "provider_override": provider_override,
+        },
+    )
+
+
+def create_task_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str] = None,
+    assignee: Optional[str] = None,
+    created_by: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
+    tenant: Optional[str] = None,
+    priority: int = 0,
+    parents: Iterable[str] = (),
+    triage: bool = False,
+    idempotency_key: Optional[str] = None,
+    max_runtime_seconds: Optional[int] = None,
+    skills: Optional[Iterable[str]] = None,
+    max_retries: Optional[int] = None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
+    goal_mode: bool = False,
+    goal_max_turns: Optional[int] = None,
+    initial_status: str = "running",
+    session_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> str:
+    """Create one task inside a caller-supplied open write transaction.
+
+    This is the documented public seam for atomic multi-card graph
+    writes (the ``hermes_cli.kanban_graph_write`` adapter composes
+    many of these calls inside one ``BEGIN IMMEDIATE`` envelope so
+    every row — task rows, link rows, events, and the caller's
+    GraphIt state rows — commits together or rolls back together).
+
+    Behavioural contract vs. :func:`create_task`:
+
+    - ``conn`` MUST already have an open write transaction. The
+      helper does NOT issue ``BEGIN IMMEDIATE`` / ``COMMIT`` itself.
+      Calling it outside an open txn raises ``ProgrammingError``.
+    - All validation, idempotency short-circuit, and event append
+      semantics match :func:`create_task`. The only difference is
+      who owns the transaction envelope.
+    - Project-linked worktree handling, idempotency pre-flight, and
+      ``assignee`` canonicalisation are identical.
+
+    Returns the new task id. If ``idempotency_key`` matches an
+    existing non-archived task, that task's id is returned (no new
+    row is created, no event is appended).
+
+    Raises on any pre-validation failure (unknown parent, invalid
+    workspace_kind, invalid model/provider combo, etc.) or on any
+    underlying SQLite error. The caller owns rollback.
+    """
+    if model_override is not None:
+        model_override = (model_override or "").strip() or None
+    if provider_override is not None:
+        provider_override = (provider_override or "").strip() or None
+    if provider_override and not model_override:
+        raise ValueError("provider_override requires a model_override")
+    assignee = _canonical_assignee(assignee)
+    if not title or not title.strip():
+        raise ValueError("title is required")
+    if initial_status not in VALID_INITIAL_STATUSES:
+        raise ValueError(
+            f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    if workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}"
+        )
+    if branch_name is not None:
+        branch_name = str(branch_name).strip() or None
+    if branch_name and workspace_kind != "worktree":
+        raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # Project-linked worktree path resolution lives outside the body
+    # helper (it reads from the per-profile projects.db). We re-use the
+    # same pre-resolution logic as create_task so callers see identical
+    # behaviour whether they go through create_task or this in-transaction
+    # seam.
+    project_obj = None
+    project_repo: Optional[str] = None
+    if project_id is not None:
+        project_id = str(project_id).strip() or None
+    if project_id:
+        from hermes_cli import projects_db as _pdb
+        try:
+            with _pdb.connect_closing() as _pconn:
+                project_obj = _pdb.get_project(_pconn, project_id)
+        except Exception:
+            project_obj = None
+        if project_obj is None:
+            # Drop the link rather than crash — same fallback as create_task.
+            project_id = None
+        else:
+            project_id = project_obj.id
+            if workspace_kind == "scratch" and project_obj.primary_path:
+                workspace_kind = "worktree"
+            if (
+                workspace_kind == "worktree"
+                and workspace_path is None
+                and project_obj.primary_path
+            ):
+                project_repo = str(project_obj.primary_path)
+
+    parents_tuple = tuple(p for p in parents if p)
+
+    # Normalise + validate skills the same way create_task does.
+    skills_list: Optional[list[str]] = None
+    if skills is not None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        toolset_typos: list[str] = []
+        for s in skills:
+            if not s:
+                continue
+            name = str(s).strip()
+            if not name:
+                continue
+            if "," in name:
+                raise ValueError(
+                    f"skill name cannot contain comma: {name!r} "
+                    "(pass a list of separate names instead of a comma-joined string)"
+                )
+            if name.casefold() in KNOWN_TOOLSET_NAMES:
+                toolset_typos.append(name)
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            cleaned.append(name)
+        if toolset_typos:
+            quoted = ", ".join(repr(n) for n in toolset_typos)
+            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+            raise ValueError(
+                f"{quoted} {noun}, not skill name(s). "
+                "Skills are named skill bundles (e.g. `blogwatcher`); "
+                "toolsets are runtime capabilities."
+            )
+        skills_list = cleaned
+
+    # Idempotency pre-flight — return existing matching non-archived row
+    # without touching the DB (the caller's transaction stays clean).
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
+
+    now = int(time.time())
+
+    # Retry once on the extremely unlikely id collision.
+    for attempt in range(2):
+        task_id = _new_task_id()
+        try:
+            _create_task_body(
+                conn,
+                task_id=task_id,
+                now=now,
+                title=title,
+                body=body,
+                assignee=assignee,
+                priority=priority,
+                created_by=created_by,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+                branch_name=branch_name,
+                project_id=project_id,
+                project_obj=project_obj,
+                project_repo=project_repo,
+                tenant=tenant,
+                idempotency_key=idempotency_key,
+                max_runtime_seconds=max_runtime_seconds,
+                skills_list=skills_list,
+                max_retries=max_retries,
+                model_override=model_override,
+                provider_override=provider_override,
+                goal_mode=goal_mode,
+                goal_max_turns=goal_max_turns,
+                session_id=session_id,
+                parents=parents_tuple,
+                initial_status=initial_status,
+                triage=triage,
+            )
+            return task_id
+        except sqlite3.IntegrityError:
+            if attempt == 1:
+                raise
             continue
     raise RuntimeError("unreachable")
 
@@ -3351,30 +3623,58 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
-        missing = _find_missing_parents(conn, [parent_id, child_id])
-        if missing:
-            raise ValueError(f"unknown task(s): {', '.join(missing)}")
-        if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(
-                f"linking {parent_id} -> {child_id} would create a cycle"
-            )
+        _link_tasks_in_transaction_body(conn, parent_id, child_id)
+
+
+def link_tasks_in_transaction(
+    conn: sqlite3.Connection, parent_id: str, child_id: str
+) -> None:
+    """Link one parent→child edge inside a caller-supplied open write transaction.
+
+    Documented public seam for atomic multi-card graph writes — see
+    :func:`create_task_in_transaction`. The caller owns the
+    transaction envelope and the rollback-on-error semantics.
+
+    Validates parent/child existence and cycle-freeness using the
+    same helpers as :func:`link_tasks`; on success, inserts the
+    link row and the matching ``linked`` event row.
+    """
+    if parent_id == child_id:
+        raise ValueError("a task cannot depend on itself")
+    missing = _find_missing_parents(conn, [parent_id, child_id])
+    if missing:
+        raise ValueError(f"unknown task(s): {', '.join(missing)}")
+    if _would_cycle(conn, parent_id, child_id):
+        raise ValueError(
+            f"linking {parent_id} -> {child_id} would create a cycle"
+        )
+    _link_tasks_in_transaction_body(conn, parent_id, child_id)
+
+
+def _link_tasks_in_transaction_body(
+    conn: sqlite3.Connection, parent_id: str, child_id: str
+) -> None:
+    """Shared INSERT + event body used by both ``link_tasks`` and
+    ``link_tasks_in_transaction``. Assumes ``conn`` has an open write
+    transaction and the caller has already validated parent/child
+    existence and acyclicity."""
+    conn.execute(
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (parent_id, child_id),
+    )
+    # If child was ready but parent is not yet done, demote child to todo.
+    parent_status = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+    ).fetchone()["status"]
+    if parent_status != "done":
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+            (child_id,),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
-        _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
-        )
+    _append_event(
+        conn, child_id, "linked",
+        {"parent": parent_id, "child": child_id},
+    )
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -3759,6 +4059,23 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+    """
+    append_event_in_transaction(conn, task_id, kind, payload, run_id=run_id)
+
+
+def append_event_in_transaction(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Public seam: append one ``task_events`` row inside a caller-supplied
+    open write transaction. Mirrors :func:`_append_event` but exposes
+    the in-transaction contract under a documented public name so the
+    GraphIt adapter can call it without depending on a private
+    single-underscore symbol.
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
@@ -8918,6 +9235,11 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    # A Herdr-backed HERMES_BIN launches the real worker in a detached pane.
+    # Give that launcher the already-resolved board log so its child output
+    # remains visible through `hermes kanban log` rather than being stranded
+    # in the bridge runtime directory.
+    env["HERMES_KANBAN_WORKER_LOG"] = str(log_path)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
