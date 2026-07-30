@@ -3100,6 +3100,125 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+# ---------------------------------------------------------------------------
+# Six-part card template (rev1) — applied at the top of ``_create_task_body``
+# ---------------------------------------------------------------------------
+# See ``plan-rev1`` (admin-orchestrator, six-part-card-template). This is a
+# pure, in-process transformation: the template lives as a code constant
+# (loaded at import, never read from disk) and is prepended to ``body``
+# when the gate fires. Both public creation routes — ``create_task`` and
+# ``create_task_in_transaction`` — funnel through ``_create_task_body``,
+# so a single prepend call covers both.
+
+_SIX_PART_TEMPLATE_V1 = """## Task
+<one-sentence objective — caller fills or leave "_to fill_">
+
+## Resources
+- _to fill_
+
+## Autonomy
+- Read: autonomous
+- Write (non-RED): autonomous
+- RED / external / financial: gate Murali
+
+## Goal
+- Acceptance criteria: _to fill_
+- Done condition: _to fill_
+
+## Guardrails
+- Risk class: <GREEN|YELLOW|RED>
+- Idempotence: required
+- Backup: required for YELLOW+
+- Approval: required for RED
+
+## Output
+- Artifacts (paths / share links): _to fill_
+- Verification evidence: _to fill_
+- HANDOFF.md entry: yes"""
+
+_SIX_HEADINGS = ("## Task", "## Resources", "## Autonomy",
+                 "## Goal", "## Guardrails", "## Output")
+_SIX_HEADINGS_TITLES = ("Task", "Resources", "Autonomy",
+                        "Goal", "Guardrails", "Output")
+_PLANNER_ASSIGNEES = frozenset({"planner", "architect", "ta-ra",
+                                 "coder", "analyst"})
+_PERSISTENT_WORKSPACES = frozenset({"dir", "worktree"})
+
+_TITLE_INTENT_RE = re.compile(
+    r"(?i)^[ \t]*(?:graphit|intake|plan|decompose|verify)"
+    r"(?:[ \t]*[:\u2014\-][ \t]*|[ \t]+|\Z)"
+)
+
+_FRONT_MATTER_RE = re.compile(
+    r"\A(?:\ufeff)?---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL
+)
+_KV_RE = re.compile(r"(?m)^[ \t]*([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(\S.*?)[ \t]*$")
+
+
+def _leading_frontmatter_value(body: str, key: str):
+    if not body:
+        return None
+    m = _FRONT_MATTER_RE.match(body)
+    if not m:
+        return None
+    block = m.group(1)
+    if block.count("---") > 0:
+        return None
+    values = []
+    for line in block.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        km = _KV_RE.match(line)
+        if km and km.group(1) == key:
+            values.append(km.group(2).strip().strip('"').strip("'"))
+    return values[0] if len(values) == 1 else None
+
+
+_LEADING_TASK_RE = re.compile(
+    r"\A(?:\ufeff)?[ \t]*##[ \t]+Task[ \t]*(?:\r?\n|\Z)"
+)
+
+
+def _has_complete_six_headings(body: str) -> bool:
+    if not body:
+        return False
+    headings = re.findall(r"(?m)^[ \t]*##[ \t]+(\S+)", body.lstrip("\ufeff"))
+    return tuple(h.strip(":").strip() for h in headings[:6]) == _SIX_HEADINGS_TITLES
+
+
+def _six_part_template_applies(body, title, assignee, workspace_kind) -> bool:
+    if body and _has_complete_six_headings(body):
+        return False
+    if body and _LEADING_TASK_RE.match(body):
+        return False
+    if title and _TITLE_INTENT_RE.match(title):
+        return True
+    explicit_opt_in = _leading_frontmatter_value(body, "template") == "six-part-v1"
+    planner_context = (
+        (assignee or "").casefold() in _PLANNER_ASSIGNEES
+        and workspace_kind in _PERSISTENT_WORKSPACES
+    )
+    if explicit_opt_in and planner_context:
+        return True
+    return False
+
+
+def _apply_six_part_template(body, title, assignee, workspace_kind):
+    if not _six_part_template_applies(body, title, assignee, workspace_kind):
+        return body
+    if body is None or body == "":
+        return _SIX_PART_TEMPLATE_V1
+    fm = _FRONT_MATTER_RE.match(body)
+    if fm:
+        frontmatter = body[: fm.end()]
+        rest = body[fm.end():]
+        separator = "" if frontmatter.endswith(("\n", "\r")) else "\n"
+        if rest:
+            return f"{frontmatter}{separator}{_SIX_PART_TEMPLATE_V1}\n\n{rest}"
+        return f"{frontmatter}{separator}{_SIX_PART_TEMPLATE_V1}"
+    return f"{_SIX_PART_TEMPLATE_V1}\n\n{body}"
+
+
 def _create_task_body(
     conn: sqlite3.Connection,
     *,
@@ -3140,6 +3259,7 @@ def _create_task_body(
     ``BEGIN IMMEDIATE`` / ``COMMIT`` is issued here. The caller owns
     the transaction envelope and the rollback-on-error semantics.
     """
+    body = _apply_six_part_template(body, title, assignee, workspace_kind)
     parents_list = list(parents)
     # Determine task status from parent status, unless the caller
     # parks it directly in blocked for human-ops review or in
