@@ -426,6 +426,8 @@ class TestWorkerSpawnEnv:
         # DB path should match the per-board DB, not the legacy default.
         expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
+        expected_log = fresh_home / "kanban" / "boards" / "spawntest" / "logs" / "t_abc.log"
+        assert env["HERMES_KANBAN_WORKER_LOG"] == str(expected_log)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
